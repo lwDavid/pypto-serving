@@ -57,7 +57,7 @@ def test_glm_family_topology_and_runtime_options(tmp_path, ranks, chunked, thres
         "enable_chunk_prefill": chunked, "long_prefill_token_threshold": threshold,
     }
     runtime = kernel_api.build_glm53_runtime_config(
-        RuntimeConfig(page_size=128, max_batch_size=4, max_seq_len=512, max_num_batched_tokens=128),
+        RuntimeConfig(page_size=640, max_batch_size=4, max_seq_len=512, max_num_batched_tokens=128),
         tp_size=ranks, **engine_options,
     )
     engine = AsyncLLMEngine(
@@ -74,8 +74,8 @@ def test_glm_family_topology_and_runtime_options(tmp_path, ranks, chunked, thres
     disabled = build_serving_engine_config(build_parser().parse_args(options + ["--no-enable-prefix-caching"]))
     assert not disabled.enable_prefix_cache
     assert tuple(group.name for group in config.runtime_config.kv_cache_groups) == ("attention", "kda_state")
-    with pytest.raises(ValueError, match="max-num-seqs must be 1..16"):
-        build_serving_engine_config(build_parser().parse_args(options + ["--max-num-seqs", "17"]))
+    with pytest.raises(ValueError, match="max-num-seqs must be 1..32"):
+        build_serving_engine_config(build_parser().parse_args(options + ["--max-num-seqs", "33"]))
     with pytest.raises(ValueError, match="requires TP8/EP8/DP1 or TP16/EP16/DP1"):
         build_serving_engine_config(build_parser().parse_args(options + ["--ep", "1"]))
     with pytest.raises(ValueError, match="requires TP8/EP8/DP1 or TP16/EP16/DP1"):
@@ -90,10 +90,41 @@ def test_glm_family_topology_and_runtime_options(tmp_path, ranks, chunked, thres
 def test_glm_runtime_config_rejects_unsupported_tp_size(tp_size):
     with pytest.raises(ValueError, match="requires TP8/EP8/DP1 or TP16/EP16/DP1"):
         kernel_api.build_glm53_runtime_config(
-            RuntimeConfig(page_size=128, max_num_batched_tokens=128),
+            RuntimeConfig(page_size=640, max_num_batched_tokens=128),
             tp_size=tp_size, max_num_running_reqs=1, max_num_scheduled_tokens=128,
             enable_chunk_prefill=True, long_prefill_token_threshold=32,
         )
+
+
+def test_glm_a3_recipe_accepts_32_requests_8192_tokens_and_1m_context():
+    runtime = kernel_api.build_glm53_runtime_config(
+        RuntimeConfig(page_size=640, max_batch_size=32, max_seq_len=1048576, max_num_batched_tokens=8192),
+        tp_size=16, max_num_running_reqs=32, max_num_scheduled_tokens=8192,
+        enable_chunk_prefill=True, long_prefill_token_threshold=8192,
+    )
+    assert (runtime.max_batch_size, runtime.max_seq_len, runtime.max_num_batched_tokens) == (32, 1048576, 8192)
+    assert runtime.kv_dtype == "int8"
+    assert runtime.max_prefill_tokens_per_request == 8192
+    assert kernel_api.packed_capacity(8192) == 8192
+    for values in ((33, 1048576, 8192), (32, 1048577, 8192), (32, 1048576, 8193)):
+        with pytest.raises(ValueError):
+            kernel_api.validate_serving_limits(*values)
+
+
+def test_glm_mtp_recipe_uses_shifted_prefix_hashes(tmp_path):
+    (tmp_path / "config.json").write_text('{"model_type":"glm5_next"}')
+    options = ["--model", str(tmp_path), "--devices", ",".join(map(str, range(16))),
+               "--tp", "16", "--ep", "16", "--max-num-seqs", "32", "--max-model-len", "1048576",
+               "--max-num-batched-tokens", "8192", "--speculative-config",
+               '{"method":"deepseek_mtp","num_speculative_tokens":5}']
+    config = build_serving_engine_config(build_parser().parse_args(options))
+    assert config.runtime_config.num_speculative_tokens == 5
+    assert config.runtime_config.kv_cache_groups[0].is_eagle_group
+    assert config.enable_prefix_cache
+    with pytest.raises(ValueError, match="0..5"):
+        build_serving_engine_config(build_parser().parse_args(options[:-1] + [
+            '{"method":"deepseek_mtp","num_speculative_tokens":6}',
+        ]))
 
 
 def test_programmatic_engine_consumes_explicit_topology_and_limits(monkeypatch):
@@ -103,7 +134,7 @@ def test_programmatic_engine_consumes_explicit_topology_and_limits(monkeypatch):
         placement_mode="overlapped", devices=tuple(range(8)),
     )
     runtime = kernel_api.build_glm53_runtime_config(
-        RuntimeConfig(page_size=128, max_batch_size=3, max_seq_len=512, max_num_batched_tokens=16),
+        RuntimeConfig(page_size=640, max_batch_size=3, max_seq_len=512, max_num_batched_tokens=16),
         tp_size=parallel.tensor_parallel_size, max_num_running_reqs=3, max_num_scheduled_tokens=16,
         enable_chunk_prefill=True, long_prefill_token_threshold=2048,
     )
@@ -136,7 +167,7 @@ def test_glm_config_rejects_scheduler_limits_instead_of_clamping(field, value):
     limits = {"max_num_running_reqs": 3, "max_num_scheduled_tokens": 16, field: value}
     with pytest.raises(ValueError, match=field):
         kernel_api.build_glm53_runtime_config(
-            RuntimeConfig(page_size=128, max_batch_size=3, max_seq_len=512, max_num_batched_tokens=16),
+            RuntimeConfig(page_size=640, max_batch_size=3, max_seq_len=512, max_num_batched_tokens=16),
             tp_size=8, enable_chunk_prefill=True, long_prefill_token_threshold=2048, **limits,
         )
 
@@ -149,7 +180,7 @@ def test_glm_config_rejects_scheduler_limits_instead_of_clamping(field, value):
 ])
 def test_glm_config_rejects_incomplete_prefill_chunks_before_engine_start(runtime_options, engine_options):
     runtime = RuntimeConfig(**{
-        "page_size": 128, "max_batch_size": 4, "max_seq_len": 512,
+        "page_size": 640, "max_batch_size": 4, "max_seq_len": 512,
         "max_num_batched_tokens": 128, **runtime_options,
     })
     limits = {"max_num_running_reqs": 4, "max_num_scheduled_tokens": 128,
@@ -162,11 +193,11 @@ def test_glm_config_rejects_incomplete_prefill_chunks_before_engine_start(runtim
 
 
 @pytest.mark.parametrize("runtime_options,error", [
-    ({"page_size": 64}, "page_size=128"),
+    ({"page_size": 64}, "page_size=640"),
     ({"weight_dtype": "float32"}, "weight_dtype='bfloat16'"),
 ])
 def test_glm_config_rejects_unsupported_storage_before_engine_start(runtime_options, error):
-    options = {"page_size": 128, **runtime_options}
+    options = {"page_size": 640, **runtime_options}
     with pytest.raises(ValueError, match=error):
         kernel_api.build_glm53_runtime_config(
             RuntimeConfig(**options),
@@ -177,7 +208,7 @@ def test_glm_config_rejects_unsupported_storage_before_engine_start(runtime_opti
 
 @pytest.mark.parametrize("context", [512, 16384])
 def test_compiler_selects_each_phase_from_its_own_module(monkeypatch, context):
-    prefill, decode, reset, run_config = (object() for _ in range(4))
+    prefill, decode, verify, mtp, reset, commit, run_config = (object() for _ in range(7))
     compiled, imports = [], []
 
     def compile_entry(name, entry):
@@ -187,6 +218,7 @@ def test_compiler_selects_each_phase_from_its_own_module(monkeypatch, context):
     api = SimpleNamespace(
         CAPACITY=256, MAX_SEQ_LEN=context, CACHE_TOKENS=16 * context, TP_SIZE=8, EP_SIZE=8,
         l3_prefill_fwd=prefill, l3_reset_request_caches=reset,
+        l3_verify_fwd=verify, l3_mtp_fwd=mtp, l3_commit_target=commit,
     )
 
     def import_phase(name, **geometry):
@@ -204,8 +236,10 @@ def test_compiler_selects_each_phase_from_its_own_module(monkeypatch, context):
         "tp_size": 8, "ep_size": 8, "context_limit": None,
     })]
     assert compiled == [("glm53_prefill", prefill), ("glm53_decode", decode),
-                        ("glm53_reset", reset)]
-    assert programs == {"prefill": prefill, "decode": decode, "_auxiliary": {"reset": reset}}
+                        ("glm53_verify", verify), ("glm53_mtp", mtp),
+                        ("glm53_reset", reset), ("glm53_commit", commit)]
+    assert programs == {"prefill": prefill, "decode": decode, "verify": verify, "mtp": mtp,
+                        "_auxiliary": {"reset": reset, "commit": commit}}
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -280,7 +314,8 @@ def test_executor_checks_weights_before_compilation_and_preserves_devices(tmp_pa
 
 def _runner(ranks=8, *, requests=3, context=32, budget=8):
     """Run real staging/dispatch/reclaim against a small in-memory device."""
-    runtime = RuntimeConfig(page_size=128, max_batch_size=requests,
+    batch_size = kernel_api.KERNEL_BATCH
+    runtime = RuntimeConfig(page_size=640, max_batch_size=requests,
                             max_seq_len=context, max_num_batched_tokens=budget,
                             kv_cache_groups=kernel_api.build_glm53_cache_group_specs(context, budget, tp_size=ranks))
     device = SimpleNamespace(runtime=runtime, inputs=[], resets=[], tokens={}, cached_states={},
@@ -290,7 +325,7 @@ def _runner(ranks=8, *, requests=3, context=32, budget=8):
         if device.failure == "forward":
             raise RuntimeError("device failure")
         device.prepared_inputs.append([list(tokens) for tokens in sequences])
-        tokens = torch.zeros(16, max(context, budget), dtype=torch.int32)
+        tokens = torch.zeros(batch_size, max(context, budget), dtype=torch.int32)
         sizes = torch.tensor([len(chunk) for chunk in sequences], dtype=torch.int32)
         for slot, chunk in enumerate(sequences):
             tokens[slot, :len(chunk)] = torch.tensor(chunk, dtype=torch.int32)
@@ -370,15 +405,15 @@ def _runner(ranks=8, *, requests=3, context=32, budget=8):
             self.inflight = 0
 
     api = SimpleNamespace(
-        BATCH=16, RANKS=1, LOCAL_VOCAB=32, CONSTANT_STEP_INPUTS=set(), _PARAM_TO_STACK={},
-        BLOCK_SIZE=128, CHUNK_TILE=16, KDA_STATE_COLUMNS=2 + (kernel_api.packed_capacity(budget) + 15) // 16,
+        BATCH=batch_size, RANKS=1, LOCAL_VOCAB=32, CONSTANT_STEP_INPUTS=set(), _PARAM_TO_STACK={},
+        BLOCK_SIZE=640, CHUNK_TILE=16, KDA_CHECKPOINT_BASE=batch_size * 7, KDA_STATE_COLUMNS=2 + (kernel_api.packed_capacity(budget) + 15) // 16,
         KDA_STATE_BLOCKS=runtime.kv_cache_groups[1].max_blocks_per_seq,
         prepare_step_inputs=prepare_inputs, forward_epoch_guard=lambda index: index,
-        forward_query_tensor_names=lambda: (), forward_geometry=lambda phase: {"query_capacity": 16},
+        forward_query_tensor_names=lambda: (), forward_geometry=lambda phase: {"query_capacity": batch_size},
         forward_parameter_names=lambda phase, **options: ("tokens", "sizes", "prior", "state_rows", "head_hidden", "logits"),
         forward_tensor_layouts=lambda phase, **options: {
             **{name: (tuple(value.shape), value.dtype) for name, value in sample.items()},
-            "head_hidden": ((16, 1), torch.float32), "logits": ((16, 32), torch.float32),
+            "head_hidden": ((batch_size, 1), torch.float32), "logits": ((batch_size, 32), torch.float32),
         },
     )
     programs = {phase: L3Callable(object(), phase) for phase in ("prefill", "decode")}
@@ -389,18 +424,18 @@ def _runner(ranks=8, *, requests=3, context=32, budget=8):
     assert pages == runtime.kv_cache_groups[0].num_blocks
     runner.programs = programs
     runner.config, runner.weights, runner._dispatch_error = None, object(), None
-    runner._seq_lens, runner._invalid_slots = torch.zeros(16, dtype=torch.int32), set()
-    runner.cache_pages = SimpleNamespace(table=torch.full((16, (context + 127) // 128), -1, dtype=torch.int32))
+    runner._seq_lens, runner._invalid_slots = torch.zeros(batch_size, dtype=torch.int32), set()
+    runner.cache_pages = SimpleNamespace(table=torch.full((batch_size, (context + 639) // 640), -1, dtype=torch.int32))
     runner._local_cache = KvCacheManager(enable_prefix_cache=False)
     runner._local_cache.init_groups(runtime.kv_cache_groups, max_batch_size=requests)
     runner.calls, runner.main_dispatches, runner.guard_events = 0, 0, []
     runner._next_forward_epoch = {"prefill": 0, "decode": 0}
-    runner._head_rows_by_slot = [torch.empty(1, 16, 1).share_memory_() for _ in range(2)]
-    runner._logits_by_slot = [torch.empty(1, 16, 32).share_memory_() for _ in range(2)]
+    runner._head_rows_by_slot = [torch.empty(1, batch_size, 1).share_memory_() for _ in range(2)]
+    runner._logits_by_slot = [torch.empty(1, batch_size, 32).share_memory_() for _ in range(2)]
     runner._phase_tensors = []
-    sample = {"tokens": torch.zeros(16, max(context, budget), dtype=torch.int32),
-              "sizes": torch.zeros(16, dtype=torch.int32), "prior": torch.zeros(16, dtype=torch.int32),
-              "state_rows": torch.full((16, api.KDA_STATE_COLUMNS), -1, dtype=torch.int32)}
+    sample = {"tokens": torch.zeros(batch_size, max(context, budget), dtype=torch.int32),
+              "sizes": torch.zeros(batch_size, dtype=torch.int32), "prior": torch.zeros(batch_size, dtype=torch.int32),
+              "state_rows": torch.full((batch_size, api.KDA_STATE_COLUMNS), -1, dtype=torch.int32)}
     for buffer_slot in range(2):
         phases = {}
         for phase in programs:
@@ -487,7 +522,7 @@ def test_worker_samples_only_terminal_glm_chunks():
         placement_mode="overlapped", devices=tuple(range(8)),
     )
     runtime = kernel_api.build_glm53_runtime_config(
-        RuntimeConfig(page_size=128), tp_size=parallel.tensor_parallel_size,
+        RuntimeConfig(page_size=640), tp_size=parallel.tensor_parallel_size,
         max_num_running_reqs=1, max_num_scheduled_tokens=4096,
         enable_chunk_prefill=True, long_prefill_token_threshold=2048,
     )
@@ -506,6 +541,13 @@ def test_worker_samples_only_terminal_glm_chunks():
             request_id=request_id, prompt_token_ids=tokens, temperature=0, top_p=1, top_k=None,
         )
     output = {}
+    staged = worker._make_prefill_batch([
+        PrefillRequest(request_id="a", chunk_tokens=[1], num_computed_tokens=0, block_ids=[0],
+                       block_ids_by_group=_groups("a")),
+        PrefillRequest(request_id="b", chunk_tokens=[4, 5], num_computed_tokens=0, block_ids=[1],
+                       block_ids_by_group=_groups("b")),
+    ], model)
+    assert staged.next_token_ids == [2, None]
     worker._batch_prefill([
         PrefillRequest(request_id="a", chunk_tokens=[1], num_computed_tokens=0, block_ids=[0], block_ids_by_group=_groups("a")),
         PrefillRequest(request_id="b", chunk_tokens=[4, 5], num_computed_tokens=0, block_ids=[1], block_ids_by_group=_groups("b")),
@@ -519,37 +561,37 @@ def test_worker_samples_only_terminal_glm_chunks():
 
 
 @pytest.mark.parametrize("ranks", [8, 16])
-@pytest.mark.parametrize("prompt_length", [128, 160])
+@pytest.mark.parametrize("prompt_length", [640, 672])
 def test_cli_prefix_cache_leaves_a_prompt_suffix_to_compute(tmp_path, ranks, prompt_length):
     (tmp_path / "config.json").write_text('{"model_type":"glm5_next"}')
     config = build_serving_engine_config(build_parser().parse_args([
         "--model", str(tmp_path), "--devices", ",".join(map(str, range(ranks))),
         "--tp", str(ranks), "--ep", str(ranks), "--max-num-seqs", "1",
-        "--max-model-len", "512", "--max-num-batched-tokens", "128",
-        "--long-prefill-token-threshold", "128", "--enable-prefix-caching",
+        "--max-model-len", "1280", "--max-num-batched-tokens", "640",
+        "--long-prefill-token-threshold", "640", "--enable-prefix-caching",
     ]))
     core = ReplicaEngineCore(config, SimpleNamespace(eos_token_id=None))
     manager, scheduler = core.kv_cache_manager, core.scheduler
     manager.initialize(config.runtime_config, num_blocks=config.runtime_config.kv_cache_groups[0].num_blocks,
                        group_num_blocks={group.name: group.num_blocks for group in config.runtime_config.kv_cache_groups})
-    scheduler.add_request(Request("producer", [1] * 128, max_new_tokens=1))
+    scheduler.add_request(Request("producer", [1] * 640, max_new_tokens=1))
     produced = scheduler.schedule()
     command = core._build_step_command(produced, [], 1)
     assert command.prefill_requests[0].block_ids_by_group
     scheduler.advance_after_schedule(produced)
     scheduler.update_from_output(produced, {"producer": [3]})
 
-    suffix = [2] * (prompt_length - 128)
-    scheduler.add_request(Request("consumer", [1] * 128 + suffix, max_new_tokens=1))
+    suffix = [2] * (prompt_length - 640)
+    scheduler.add_request(Request("consumer", [1] * 640 + suffix, max_new_tokens=1))
     restored = scheduler.schedule()
     command = core._build_step_command(restored, ["producer"], 2)
     request = command.prefill_requests[0]
     if suffix:
-        assert request.num_computed_tokens == 128
+        assert request.num_computed_tokens == 640
         assert request.chunk_tokens == suffix
     else:
         assert request.num_computed_tokens == 0
-        assert request.chunk_tokens == [1] * 128
+        assert request.chunk_tokens == [1] * 640
 
 
 def test_runner_prepares_metadata_then_submits_one_complete_forward_per_phase():
@@ -681,39 +723,39 @@ def test_failed_worker_close_keeps_arguments_alive_until_retry_succeeds():
 
 @pytest.mark.parametrize("ranks", [8, 16])
 def test_grouped_prefix_shares_history_and_preserves_kda_seed(ranks):
-    runner, device = _runner(ranks, context=1024, budget=256)
+    runner, device = _runner(ranks, context=2560, budget=1280)
     cache = KvCacheManager(enable_prefix_cache=True)
     cache.init_groups(device.runtime.kv_cache_groups, max_batch_size=4)
-    tokens = list(range(256))
+    tokens = list(range(1280))
     hashes = cache.compute_group_block_hashes(tokens)
-    groups = cache.ensure_group_blocks("producer", 256)
+    groups = cache.ensure_group_blocks("producer", 1280)
     cache.retain_group_block_snapshot(groups, 0)
-    batch = _prefill(["producer"], [tokens], [0], [257])
+    batch = _prefill(["producer"], [tokens], [0], [1281])
     batch.block_ids_by_group = [groups]
     runner.run_prefill(None, batch)
     # Device completion alone does not publish pages before the scheduler ACK.
-    assert cache.acquire_group_prefix_blocks("early", hashes, max_cache_hit_tokens=128)[1] == 0
-    cache.cache_group_blocks_from_snapshot(hashes, 256, {}, groups, 0, request_id="producer")
+    assert cache.acquire_group_prefix_blocks("early", hashes, max_cache_hit_tokens=640)[1] == 0
+    cache.cache_group_blocks_from_snapshot(hashes, 1280, {}, groups, 0, request_id="producer")
     cache.release_group_block_snapshot(groups, 0)
 
     restored, hit, partition = cache.acquire_group_prefix_blocks(
-        "consumer", cache.compute_group_block_hashes(tokens[:128] + [500]), max_cache_hit_tokens=128,
+        "consumer", cache.compute_group_block_hashes(tokens[:640] + [500]), max_cache_hit_tokens=640,
     )
-    assert hit == 128 and partition == 0
+    assert hit == 640 and partition == 0
     assert restored["attention"] == groups["attention"][:1]
-    state_row = runner._api.BATCH + restored["kda_state"][0]
-    assert device.cached_states[state_row] == tokens[:128]
+    state_row = runner._api.KDA_CHECKPOINT_BASE + restored["kda_state"][0]
+    assert device.cached_states[state_row] == tokens[:640]
     saved = list(device.cached_states[state_row])
-    consumer_groups = cache.ensure_group_blocks("consumer", 129)
-    batch = _prefill(["consumer"], [[500]], [128], [129])
+    consumer_groups = cache.ensure_group_blocks("consumer", 641)
+    batch = _prefill(["consumer"], [[500]], [640], [641])
     batch.block_ids_by_group = [consumer_groups]
     result = runner.run_prefill(None, batch)
-    assert device.inputs[-1][2] == [128]
+    assert device.inputs[-1][2] == [640]
     assert result.logits.argmax(-1).item() == (sum(saved) + 500) % 32
     assert device.cached_states[state_row] == saved
 
-    decode = _decode(["consumer"], [501], [130])
-    decode.block_ids_by_group = [cache.ensure_group_blocks("consumer", 130)]
+    decode = _decode(["consumer"], [501], [642])
+    decode.block_ids_by_group = [cache.ensure_group_blocks("consumer", 642)]
     runner.run_decode(None, decode)
     assert device.cached_states[state_row] == saved
     assert device.tokens[0] == tokens  # Producer's working state remains independent.
@@ -741,4 +783,64 @@ def test_group_pools_report_independent_physical_capacities():
     cache = KvCacheManager()
     cache.initialize(device.runtime, num_blocks=sizes["attention"], group_num_blocks=sizes)
     assert cache.group_num_blocks("kda_state") == sizes["kda_state"]
+    runner.close()
+
+
+def test_mtp_rejection_restores_per_request_states_and_only_accepted_checkpoints(monkeypatch):
+    runner, _ = _runner(context=1280, budget=192)
+    for request in ("a", "b", "c"):
+        for start in range(0, 637, 192):
+            runner.run_prefill(None, _prefill([request], [[1] * min(192, 637 - start)], [start], [637]))
+    api = runner._api
+    api.VERIFY_QUERY_WIDTH = 6
+    runner._num_speculative_tokens = 5
+    runner._mtp_lengths = runner._seq_lens.clone()
+    runner._mtp_logits = torch.zeros(api.BATCH, 32)
+    runner._mtp_logits[:, 7] = 10
+    runner._mtp_ready_tokens = {0: 6, 1: 6, 2: 6}
+    mtp_calls, commits = [], []
+
+    def mtp_phase(sequences, slots, **options):
+        mtp_calls.append((sequences, slots, options))
+        for slot, sequence in zip(slots, sequences, strict=True):
+            runner._mtp_lengths[slot] += len(sequence)
+        return runner._mtp_logits[slots]
+
+    original_prepare = api.prepare_step_inputs
+
+    def prepare(*args, **kwargs):
+        inputs = original_prepare(*args, **kwargs)
+        if kwargs.get("phase") == "verify":
+            # Mirror the library's verify contract: packed row ids in slot order,
+            # zero-padded. gather_head_rows has no negative-index guard.
+            total = sum(len(sequence) for sequence in args[1])
+            rows = torch.zeros(192, dtype=torch.int32)
+            rows[:total] = torch.arange(total, dtype=torch.int32)
+            inputs["logit_row_indices"] = rows
+        return inputs
+
+    logits = torch.zeros(192, 32)
+    predictions = [8, 7, 7, 7, 7, 9, 7, 7, 8, 7, 7, 9, 7, 7, 7, 7, 7, 9]
+    logits[torch.arange(18), predictions] = 10
+    monkeypatch.setattr(api, "prepare_step_inputs", prepare)
+    monkeypatch.setattr(runner, "_run_mtp_phase", mtp_phase)
+    monkeypatch.setattr(runner, "_dispatch_step", lambda *_args, **_kwargs: SimpleNamespace(error=None, buffer_slot=0))
+    monkeypatch.setattr(runner, "_reclaim_step", lambda _pending: logits)
+    monkeypatch.setattr(runner, "_commit_target", lambda feedback, sources=None, destinations=None:
+                        commits.append((feedback.clone(), sources.clone(),
+                                        None if destinations is None else destinations.clone())))
+    batch = _decode(["a", "b", "c"], [6, 6, 6], [638, 638, 638])
+    batch.block_ids_by_group = [{"attention": [i + 1, i + 10], "kda_state": [i + 1, i + 10]}
+                               for i in range(3)]
+    result = runner.run_decode(None, batch)
+    assert result.accepted_token_ids == [[8], [7, 7, 8], [7, 7, 7, 7, 7, 9]]
+    assert result.num_draft_tokens == [5, 5, 5]
+    assert runner._seq_lens[:3].tolist() == [638, 640, 643]
+    assert runner._mtp_lengths[:3].tolist() == [638, 640, 643]
+    assert commits[0][0][:3].tolist() == [0, 8, 17]
+    assert commits[0][1][:3].tolist() == [32, 40, 49]
+    assert commits[1][1][:3].tolist() == [-1, 40, 46]
+    assert commits[1][2][1:3].tolist() == [api.KDA_CHECKPOINT_BASE + 2, api.KDA_CHECKPOINT_BASE + 3]
+    assert mtp_calls[-1][0] == [[8], [7, 7, 8], [7, 7, 7, 7, 7, 9]]
+    assert mtp_calls[-1][2]["feedback_rows"] == [[0], [6, 7, 8], [12, 13, 14, 15, 16, 17]]
     runner.close()

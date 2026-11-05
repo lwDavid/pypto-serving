@@ -20,6 +20,7 @@ class Glm53CompiledKernels:
     programs: dict
     checkpoint: object
     weights: object
+    num_speculative_tokens: int = 0
 
 
 def forward_task_args(api, phase, tensors):

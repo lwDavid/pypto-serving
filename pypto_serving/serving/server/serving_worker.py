@@ -1059,6 +1059,12 @@ class WorkerProcess:
             for pr in terminal
             if (state := getattr(self, "_constraint_states", {}).get(pr.request_id)) is not None
         }
+        batch.next_token_ids = [
+            prompt[end] if end < len(prompt) else None
+            for pr in scheduled
+            for prompt in [self._req_cache[pr.request_id].prompt_token_ids]
+            for end in [pr.num_computed_tokens + len(pr.chunk_tokens)]
+        ]
         batch.stop_token_masks = {
             pr.request_id: mask
             for pr in terminal

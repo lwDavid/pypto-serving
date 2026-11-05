@@ -57,6 +57,7 @@ class SchedulerConfig:
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
     num_speculative_tokens: int = 0
+    supports_stochastic_speculation: bool = False
     supports_chunked_prefill_with_speculation: bool = True
     speculative_prefix_cache_replay_tokens: int = 0
     requires_homogeneous_prefill_decode: bool = False
@@ -473,7 +474,7 @@ class Scheduler:
                     self.config.num_speculative_tokens,
                     self.config.max_seq_len - request.num_computed_tokens - num_new,
                 )
-                if not is_prefill and request.temperature <= 0.0
+                if not is_prefill and (request.temperature <= 0.0 or self.config.supports_stochastic_speculation)
                 else 0
             )
             scheduled_tokens = num_new + speculative_tokens
@@ -886,9 +887,9 @@ class Scheduler:
         """Extra tokens beyond the first that a sampling step may emit.
 
         Mirrors the accounting ``schedule()`` uses when allocating blocks: only
-        greedy decode steps get speculative capacity.
+        runners with stochastic rejection also reserve non-greedy decode capacity.
         """
-        if scheduled.is_prefill or request.temperature > 0.0:
+        if scheduled.is_prefill or request.temperature > 0.0 and not self.config.supports_stochastic_speculation:
             return 0
         # Use the dispatch snapshot: async advancement may already have changed
         # the live request. Never reserve KV or placeholders beyond the ceiling.

@@ -50,7 +50,7 @@ def load_checkpoint(model_id: str, model_dir: str, runtime: RuntimeConfig | None
     description_path = root / "quant_model_description.json"
     if not description_path.is_file():
         raise FileNotFoundError(f"Missing {description_path.name} in {root}")
-    runtime = runtime or RuntimeConfig(max_batch_size=1, max_seq_len=512, max_num_batched_tokens=512)
+    runtime = runtime or RuntimeConfig(page_size=640, max_batch_size=1, max_seq_len=512, max_num_batched_tokens=512)
     validate_serving_limits(runtime.max_batch_size, runtime.max_seq_len, runtime.max_num_batched_tokens)
     tokenizer = load_tokenizer(root)
     config = ModelConfig(

@@ -48,8 +48,13 @@ def prepare_kernels(
     programs = {
         "prefill": compiler.compile("glm53_prefill", api.l3_prefill_fwd),
         "decode": compiler.compile("glm53_decode", decode_api.l3_decode_fwd),
+        "verify": compiler.compile("glm53_verify", api.l3_verify_fwd),
+        "mtp": compiler.compile("glm53_mtp", api.l3_mtp_fwd),
     }
-    programs["_auxiliary"] = {"reset": compiler.compile("glm53_reset", api.l3_reset_request_caches)}
+    programs["_auxiliary"] = {
+        "reset": compiler.compile("glm53_reset", api.l3_reset_request_caches),
+        "commit": compiler.compile("glm53_commit", api.l3_commit_target),
+    }
     return programs
 
 
@@ -94,7 +99,7 @@ class Glm53PyptoExecutor(PyptoExecutor):
             platform=self._platform,
             pypto_build_dir=self._pypto_build_dir,
         )
-        return Glm53CompiledKernels(api, programs, checkpoint, weights)
+        return Glm53CompiledKernels(api, programs, checkpoint, weights, runtime.num_speculative_tokens)
 
     def _create_runner(self, model_id, compiled):
         if not isinstance(compiled, Glm53CompiledKernels):
@@ -116,6 +121,7 @@ class Glm53PyptoExecutor(PyptoExecutor):
             self._device_ids,
             self._platform,
             prepared_weights=compiled.weights,
+            num_speculative_tokens=compiled.num_speculative_tokens,
             **options,
         )
 

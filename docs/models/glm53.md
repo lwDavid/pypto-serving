@@ -10,19 +10,22 @@ Direct Python callers prepare the model runtime with
 ## Supported configuration
 
 - Eight devices use overlapped TP8/EP8/DP1; sixteen use TP16/EP16/DP1.
-- `--max-num-seqs` supports 1 to 16 concurrent requests.
-- `--max-model-len` supports a context bound up to 8192 tokens.
-- The checkpoint path requires `--block-size 128` and `--dtype bfloat16`,
+- `--max-num-seqs` supports 1 to 32 concurrent requests.
+- `--max-model-len` accepts a context bound up to 1048576 tokens. The physical
+  cache pool remains bounded and must fit the device memory budget.
+- The checkpoint path requires `--block-size 640` and `--dtype bfloat16`,
   which are selected by default for GLM.
-- Serving supports text generation. Speculative decoding, vision inputs and
-  model-specific reasoning/tool parsing are not provided.
+- Serving supports text generation and up to five MTP draft tokens per greedy
+  decode iteration. Non-greedy or constrained requests use target-only decode.
+  Vision inputs and model-specific reasoning/tool parsing are not provided by
+  the HTTP serving interface.
 
 Count logical device IDs: a dual-chip board exposes two logical devices.
 
 ## Runtime settings
 
 `--max-num-batched-tokens` limits the total new tokens processed in one scheduler
-step, up to 8177. Positive `--long-prefill-token-threshold` values further limit
+step, up to 8192. Positive `--long-prefill-token-threshold` values further limit
 one request's prompt chunk. Both limits must allow at least 16 tokens, or the
 complete context when `--max-model-len` is smaller than 16.
 
@@ -31,8 +34,18 @@ to a multiple of 16; the final chunk can have any length. Disabling chunked
 prefill requires the complete prompt to fit in one dispatch.
 
 Prefix caching is enabled by default. Reuse requires a matching cached prefix
-at a 128-token boundary that is shorter than the prompt. Use
+at a 640-token boundary that is shorter than the prompt. Use
 `--no-enable-prefix-caching` to disable it.
+
+MLA uses INT8 cache rows with four FP32 group scales; the pooled Indexer cache
+is BF16. Its FP32 unpooled tail retains nine tokens per request. The vocabulary
+head retains BF16 weights and BF16 GEMM rounding before returning FP32 logits.
+
+Enable MTP with `--speculative-config '{"method":"deepseek_mtp","num_speculative_tokens":5}'`.
+Verification processes the current input and up to five proposals together,
+then restores each request's KDA convolution and recurrent state to the accepted
+token boundary. MTP cache pages include the shifted boundary token in their
+prefix hash; completed target and draft histories share only valid pages.
 
 ## Offline generation
 
@@ -46,10 +59,13 @@ pypto-serving \
   --tp 8 --ep 8 --dp 1 --max-num-seqs 4 \
   --max-model-len 512 --max-num-batched-tokens 128 \
   --long-prefill-token-threshold 32 \
+  --speculative-config '{"method":"deepseek_mtp","num_speculative_tokens":5}' \
   --prompt 'The capital of France is' \
   --prompt 'The capital of Germany is' \
   --generate-config '{"max_new_tokens": 16}'
 ```
+
+Drop `--speculative-config` to run the target model without MTP.
 
 For sixteen devices, use `--tp 16 --ep 16` and provide sixteen device IDs.
 

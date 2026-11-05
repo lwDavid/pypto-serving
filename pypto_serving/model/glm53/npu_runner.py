@@ -20,7 +20,8 @@ from typing import TYPE_CHECKING
 import torch
 from pypto.runtime import StackedDeviceTensor
 
-from pypto_serving.config.types import DecodeResult, PrefillResult
+from pypto_serving.config.types import DecodeResult, PrefillResult, SamplingParams
+from pypto_serving.model.common.executor.sampler import Sampler
 from pypto_serving.model.common.runner.buffer_set import shared_empty
 from pypto_serving.model.common.runner.l3_dispatch import L3DispatchMixin
 from pypto_serving.model.common.runner.model_runner import ModelRunner
@@ -34,6 +35,11 @@ from pypto_serving.model.glm53.weight_loader import load_kernel_weights
 
 if TYPE_CHECKING:
     from pypto.runtime import RunConfig
+
+
+# The packed forward argument list this runner builds. Bump together with
+# models/glm5_3_flash/layer.py in pypto-lib.
+SUPPORTED_FORWARD_ABI_VERSION = 11
 
 
 @dataclass
@@ -80,6 +86,7 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
         *,
         host_num_threads=None,
         prepared_weights=None,
+        num_speculative_tokens=0,
     ):
         if host_num_threads is not None and (type(host_num_threads) is not int or host_num_threads <= 0):
             raise ValueError("host_num_threads must be a positive integer or None")
@@ -87,6 +94,10 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
         self._init_l3_dispatch(stacked=True)
         self._api, self._programs, self._checkpoint = api, programs, checkpoint
         self._prepared_weights = prepared_weights
+        if type(num_speculative_tokens) is not int or not 0 <= num_speculative_tokens <= 5:
+            raise ValueError("GLM num_speculative_tokens must be an integer in 0..5")
+        self._num_speculative_tokens = num_speculative_tokens
+        self._sampler = Sampler()
         self._device_ids, self._platform = list(device_ids), platform
         self._execution_options = dict(
             host_num_threads=host_num_threads,
@@ -101,6 +112,7 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
         self._requests: dict[str, _RequestState] = {}
         self._free_slots: list[int] = []
         self._prefix_seed_slots = set()
+        self._mtp_ready_tokens: dict[int, int] = {}
 
     def _shared_l3_worker(self):
         if self._close_error is not None:
@@ -118,6 +130,7 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
         self._free_slots = list(range(self._max_batch_size))
         groups = build_glm53_cache_group_specs(
             runtime.max_seq_len, runtime.max_num_batched_tokens, tp_size=len(self._device_ids),
+            num_speculative_tokens=self._num_speculative_tokens,
         )
         self._cache_group_num_blocks = {group.name: group.num_blocks for group in groups}
         return groups[0].num_blocks
@@ -168,6 +181,8 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
         for state in states:
             if state.slot in new_slots:
                 self._seq_lens[state.slot] = state.committed_length
+                if self._num_speculative_tokens:
+                    self._mtp_lengths[state.slot] = state.committed_length
                 if state.committed_length:
                     self._prefix_seed_slots.add(state.slot)
         logits = self.forward_chunks(
@@ -223,17 +238,33 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
             offset += length
         if offset != len(flat_tokens):
             raise ValueError("GLM packed prefill tokens do not match chunk lengths")
+        if self._num_speculative_tokens:
+            next_tokens = batch.next_token_ids or [None] * count
+            if len(next_tokens) != count:
+                raise ValueError("GLM MTP requires one lookahead token entry per prefill request")
+            for next_token, state, chunk in zip(next_tokens, states, chunks, strict=True):
+                if state.committed_length + len(chunk) < state.prompt_length and next_token is None:
+                    raise ValueError("GLM MTP nonterminal prefill requires the next prompt token")
         logits = self._forward_chunks(
             batch.request_ids, chunks, states, cache_groups=batch.block_ids_by_group,
         )
+        if self._num_speculative_tokens:
+            self._refresh_mtp(chunks, [state.slot for state in states], next_tokens)
         return PrefillResult(last_hidden=None, logits=logits)
+
+    def finalize_prefill(self, request_ids, sampled_token_ids, sampling_params=None):
+        """Complete the shifted MTP cache after terminal-prefill sampling."""
+        if not self._num_speculative_tokens:
+            return
+        slots = [self._requests[request_id].slot for request_id in request_ids]
+        self._finish_mtp_tail(slots, list(sampled_token_ids))
 
     def run_decode(self, model, batch):
         return self.run_prepared_decode(model, batch, self.prepare_decode(model, batch, buffer_slot=0))
 
     @property
     def supports_async_decode_reclaim(self):
-        return True
+        return not self._num_speculative_tokens
 
     def prepare_decode(self, model, batch, *, buffer_slot):
         """Freeze metadata without reading live request state or placeholder embeddings."""
@@ -247,6 +278,16 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
         return _PreparedDecode(tuple(batch.request_ids), lengths, buffer_slot, groups)
 
     def run_prepared_decode(self, model, batch, prepared):
+        if self._num_speculative_tokens:
+            try:
+                return self._run_speculative_decode(model, batch, prepared)
+            except BaseException as error:
+                self._invalid_slots.update(
+                    self._requests[request_id].slot for request_id in batch.request_ids
+                    if request_id in self._requests
+                )
+                self._poison_forwards(error)
+                raise
         return self.reclaim_prepared_decode(self.dispatch_prepared_decode(model, batch, prepared))
 
     def dispatch_prepared_decode(self, model, batch, prepared):
@@ -302,6 +343,7 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
         self.reset_requests(slots)
         for request_id in released:
             self._requests.pop(request_id)
+        self._sampler.release_requests(released)
         self._free_slots = sorted(self._free_slots + slots)
 
     def _initialize_execution(
@@ -330,21 +372,35 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
         self.calls = 0
         self.guard_events: list[str] = []
         self._seq_lens = torch.zeros(api.BATCH, dtype=torch.int32)
+        self._mtp_lengths = torch.zeros(api.BATCH, dtype=torch.int32)
+        self._mtp_logits = torch.empty(api.BATCH, api.RANKS * api.LOCAL_VOCAB)
+        self._mtp_ready_tokens.clear()
         self.cache_pages = api.CacheTables(api.BATCH, api.MAX_SEQ_LEN)
         self._local_cache = KvCacheManager(enable_prefix_cache=False)
         self._local_cache.init_groups(build_glm53_cache_group_specs(
             api.MAX_SEQ_LEN, api.CAPACITY, tp_size=api.TP_SIZE, cache_tokens=api.CACHE_TOKENS,
+            num_speculative_tokens=self._num_speculative_tokens,
         ), max_batch_size=api.BATCH)
         self._prefix_seed_slots.clear()
         self._invalid_slots: set[int] = set()
         self._reset_program = None
         self._dispatch_error: BaseException | None = None
-        self._next_forward_epoch = {"prefill": 0, "decode": 0}
+        self._next_forward_epoch = {phase: 0 for phase in api.FORWARD_PROGRAMS}
         self.main_dispatches = 0
         self._pending_forwards = {}
-        if set(programs) != {"prefill", "decode"}:
-            raise ValueError("GLM requires separate packed prefill and decode programs")
-        required_auxiliary = {"reset"}
+        if set(programs) != set(api.FORWARD_PROGRAMS):
+            raise ValueError("GLM requires packed prefill, decode, verification and MTP programs")
+        # The packed argument list is positional, so a lib/serving pair that
+        # disagrees on the ABI otherwise fails as an opaque shape error far from
+        # the cause.
+        if api.FORWARD_ABI_VERSION != SUPPORTED_FORWARD_ABI_VERSION:
+            raise ValueError(
+                f"GLM kernels expose forward ABI {api.FORWARD_ABI_VERSION}; this serving build "
+                f"implements {SUPPORTED_FORWARD_ABI_VERSION}"
+            )
+        if len({id(program.compiled) for program in programs.values()}) != len(programs):
+            raise ValueError("GLM phases need distinct compiled-program objects to isolate communication counters")
+        required_auxiliary = {"reset", "commit"}
         missing = required_auxiliary - self.auxiliary_programs.keys()
         if missing:
             raise ValueError(f"GLM compiled kernels lack auxiliary entries: {sorted(missing)}")
@@ -397,7 +453,7 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
         inputs = api.prepare_step_inputs(weights, [[] for _ in range(api.BATCH)], cache_pages=self.cache_pages)
         self._forward_input_args = {
             (slot, phase): forward_input_task_args(api, phase, inputs)
-            for slot in range(2) for phase in ("prefill", "decode")
+            for slot in range(2) for phase in api.FORWARD_PROGRAMS
         }
         for args in self._forward_input_args.values():
             args.allocate_host_shared(None)
@@ -406,10 +462,17 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
             for slot in range(2)
         ]
         self._logits_by_slot = [
-            shared_empty((api.RANKS, api.BATCH, api.FP32_HEAD_VOCAB_PAD), torch.float32,
+            shared_empty((api.RANKS, api.LOGIT_ROWS, api.HEAD_VOCAB_PAD), torch.float32,
                          name=f"glm_logits_{slot}")
             for slot in range(2)
         ]
+        # L3 dispatch only accepts shared-memory CPU tensors allocated before the
+        # worker starts, so the commit entry's three index arguments are owned
+        # here and filled in place rather than built per call.
+        self._commit_rows = {
+            name: shared_empty((api.RANKS, api.BATCH), torch.int32, name=f"glm_commit_{name}")
+            for name in ("feedback", "restore", "destination")
+        }
         runtime = DistributedWorker(
             [entry.compiled for entry in (*self.programs.values(), *self.auxiliary_programs.values())],
             config=config, persistent=True, reset_persistent_windows=False,
@@ -428,7 +491,7 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
                                        for name, value in weights.tensor_layouts.items()})
             allocation_layouts.update({name: value for name, value in layouts.items()
                                        if name not in mutable_inputs | {"head_hidden"}})
-            for name in ("final_norm", "lm_head_weight", "logits", "ws_x_hc_a", "ws_x_hc_b"):
+            for name in ("final_norm", "lm_head_weight", "mtp_lm_head_weight", "logits", "ws_x_hc_a", "ws_x_hc_b"):
                 allocation_layouts.pop(name, None)
             per_rank = [{} for _ in self.device_ids]
             for rank, tensors in enumerate(per_rank):
@@ -447,12 +510,17 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
                 list(executor.map(upload, range(api.RANKS)))
             head = weights.lm_head()
             for rank, tensors in enumerate(per_rank):
-                shard = torch.zeros((api.FP32_HEAD_VOCAB_PAD, api.D), dtype=torch.float32)
+                shard = torch.zeros((api.HEAD_VOCAB_PAD, api.D), dtype=torch.bfloat16)
                 shard[:api.LOCAL_VOCAB].copy_(head[rank * api.LOCAL_VOCAB:(rank + 1) * api.LOCAL_VOCAB])
                 tensors["lm_head_weight"] = runtime.alloc_tensor(shard.shape, shard.dtype, init=shard,
                                                                 worker_id=rank)
+                mtp_shard = torch.zeros_like(shard)
+                mtp_shard[:api.LOCAL_VOCAB].copy_(weights.mtp_head_shard(rank))
+                tensors["mtp_lm_head_weight"] = runtime.alloc_tensor(
+                    mtp_shard.shape, mtp_shard.dtype, init=mtp_shard, worker_id=rank,
+                )
                 tensors["final_norm"] = tensors["norm.final_norm"]
-            print("GLM_DEVICE_LM_HEAD_BYTES_PER_RANK", api.FP32_HEAD_VOCAB_PAD * api.D * 4, flush=True)
+            print("GLM_DEVICE_LM_HEAD_BYTES_PER_RANK", api.HEAD_VOCAB_PAD * api.D * 2, flush=True)
 
             def stack(tensors, name):
                 return StackedDeviceTensor([rank[name] for rank in tensors],
@@ -462,13 +530,13 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
             self.stacked = stacked
             self._reset_program = self.auxiliary_programs["reset"]
             self._run_l3(self._reset_program, *(stacked[name] for name in (
-                "mla_latent_cache", "index_raw_cache", "index_pool_cache", "index_pool_scale",
+                "mla_latent_cache", "index_raw_cache", "index_pool_cache",
                 "kda_conv_state", "kda_recurrent_state")),
                 -1, config=config)
             self._phase_tensors = []
             for slot in range(2):
                 phases = {}
-                for phase in ("prefill", "decode"):
+                for phase in api.FORWARD_PROGRAMS:
                     phase_tensors = dict(self._forward_input_args[slot, phase].tensors)
                     phase_tensors["head_hidden"] = self._head_rows_by_slot[slot]
                     phase_tensors["logits"] = self._logits_by_slot[slot]
@@ -532,13 +600,16 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
             self.stacked["mla_latent_cache"],
             self.stacked["index_raw_cache"],
             self.stacked["index_pool_cache"],
-            self.stacked["index_pool_scale"],
             self.stacked["kda_conv_state"],
             self.stacked["kda_recurrent_state"],
             slot_mask,
             config=self.config,
         )
         self._seq_lens[slots] = 0
+        if self._num_speculative_tokens:
+            self._mtp_lengths[slots] = 0
+            for slot in slots:
+                self._mtp_ready_tokens.pop(slot, None)
         self.cache_pages.table[slots] = -1
         self._prefix_seed_slots.difference_update(slots)
         for slot in slots:
@@ -572,6 +643,10 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
             raise ValueError("visual features must belong to active request slots")
         new_lengths = self._seq_lens + torch.tensor([len(tokens) for tokens in sequences], dtype=torch.int32)
         state_rows = self._bind_cache_tables(slots, new_lengths, cache_groups)
+        if phase == "decode":
+            for slot in slots:
+                if state_rows[slot, 2] < 0:
+                    state_rows[slot, 2] = slot
         inputs = api.prepare_step_inputs(
             self.weights, sequences, kv_seq_lens=self._seq_lens, visual_features=visual_features,
             cache_pages=self.cache_pages, kda_state_rows=state_rows, phase=phase,
@@ -600,12 +675,12 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
             self.cache_pages.table[slot, :len(attention)] = torch.tensor(attention, dtype=torch.int32)
             if slot in self._prefix_seed_slots:
                 logical = (start - 1) // api.BLOCK_SIZE
-                state_rows[slot, 0] = api.BATCH + states[logical % api.KDA_STATE_BLOCKS]
+                state_rows[slot, 0] = api.KDA_CHECKPOINT_BASE + states[logical % api.KDA_STATE_BLOCKS]
             for chunk in range((end - start + api.CHUNK_TILE - 1) // api.CHUNK_TILE):
                 endpoint = min(start + (chunk + 1) * api.CHUNK_TILE, end)
                 if endpoint % api.BLOCK_SIZE == 0:
                     logical = endpoint // api.BLOCK_SIZE - 1
-                    state_rows[slot, chunk + 2] = api.BATCH + states[logical % api.KDA_STATE_BLOCKS]
+                    state_rows[slot, chunk + 2] = api.KDA_CHECKPOINT_BASE + states[logical % api.KDA_STATE_BLOCKS]
         return state_rows
 
     def forward_chunks(
@@ -634,17 +709,235 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
             raise
         for slot, tokens in zip(slots, token_sequences, strict=True):
             self._seq_lens[slot] += len(tokens)
+        if self._num_speculative_tokens:
+            self._commit_target_feedback(slots, token_sequences)
         self._prefix_seed_slots.difference_update(slots)
         return logits[slots]
 
 
 
 
+    def _commit_target(self, feedback_rows, restore_rows=None, destination_rows=None):
+        api = self._api
+        if restore_rows is None:
+            restore_rows = torch.full((api.BATCH,), -1, dtype=torch.int32)
+        if destination_rows is None:
+            destination_rows = torch.arange(api.BATCH, dtype=torch.int32)
+
+        def stack(name, rows):
+            buffer = self._commit_rows[name]
+            buffer.copy_(rows.to(torch.int32).unsqueeze(0).expand(api.RANKS, -1))
+            return buffer
+
+        self._run_l3(
+            self.auxiliary_programs["commit"],
+            self.stacked["target_feedback"], self.stacked["target_feedback_last"],
+            stack("feedback", feedback_rows),
+            self.stacked["kda_conv_state"], self.stacked["kda_recurrent_state"],
+            stack("restore", restore_rows), stack("destination", destination_rows), config=self.config,
+        )
+
+    def _packed_starts(self, slots, sequences):
+        counts = [0] * self._api.BATCH
+        for slot, sequence in zip(slots, sequences, strict=True):
+            counts[slot] = len(sequence)
+        return [0, *torch.tensor(counts, dtype=torch.int32).cumsum(0).tolist()]
+
+    def _commit_target_feedback(self, slots, sequences, *, accepted_lengths=None, cache_groups=None):
+        api = self._api
+        starts = self._packed_starts(slots, sequences)
+        feedback = torch.full((api.BATCH,), -1, dtype=torch.int32)
+        restore = torch.full_like(feedback, -1)
+        for index, slot in enumerate(slots):
+            count = len(sequences[index]) if accepted_lengths is None else accepted_lengths[index]
+            feedback[slot] = starts[slot] + count - 1
+            if accepted_lengths is not None:
+                restore[slot] = api.BATCH + slot * api.VERIFY_QUERY_WIDTH + count - 1
+        self._commit_target(feedback, restore)
+        if accepted_lengths is None:
+            return
+        # A six-token verification can cross at most one cache-block checkpoint.
+        checkpoint_sources = torch.full_like(feedback, -1)
+        checkpoint_destinations = torch.arange(api.BATCH, dtype=torch.int32)
+        for slot, count, groups in zip(slots, accepted_lengths, cache_groups, strict=True):
+            begin = int(self._seq_lens[slot])
+            boundary = ((begin // api.BLOCK_SIZE) + 1) * api.BLOCK_SIZE
+            if boundary <= begin + count:
+                checkpoint_sources[slot] = api.BATCH + slot * api.VERIFY_QUERY_WIDTH + boundary - begin - 1
+                logical = boundary // api.BLOCK_SIZE - 1
+                checkpoint_destinations[slot] = (
+                    api.KDA_CHECKPOINT_BASE + groups["kda_state"][logical % api.KDA_STATE_BLOCKS]
+                )
+        if bool((checkpoint_sources >= 0).any()):
+            self._commit_target(torch.full_like(feedback, -1), checkpoint_sources, checkpoint_destinations)
+
+    def _run_mtp_phase(self, sequences, slots, *, feedback_mode, feedback_rows=None, skip_topk=False):
+        api = self._api
+        packed = [[] for _ in range(api.BATCH)]
+        for slot, tokens in zip(slots, sequences, strict=True):
+            packed[slot] = list(tokens)
+        inputs = api.prepare_step_inputs(
+            self.weights, packed, kv_seq_lens=self._mtp_lengths, cache_pages=self.cache_pages,
+            phase="mtp", mtp=True,
+        )
+        inputs["mtp_feedback_mode"].fill_(feedback_mode)
+        inputs["mtp_skip_topk"].fill_(int(skip_topk))
+        inputs["mtp_feedback_indices"].fill_(-1)
+        starts = self._packed_starts(slots, sequences)
+        if feedback_rows is not None:
+            for slot, rows in zip(slots, feedback_rows, strict=True):
+                inputs["mtp_feedback_indices"][starts[slot]:starts[slot] + len(rows)] = torch.tensor(rows)
+        pending = self._dispatch_step(inputs, phase="mtp", buffer_slot=0)
+        try:
+            logits = self._reclaim_step(pending)
+        finally:
+            if pending.error is None:
+                self._pending_forwards.pop(pending.buffer_slot, None)
+        for slot, tokens in zip(slots, sequences, strict=True):
+            self._mtp_lengths[slot] += len(tokens)
+        self._mtp_logits[slots] = logits[slots]
+        return logits[slots]
+
+    def _refresh_mtp(self, sequences, slots, next_tokens, *, feedback_starts=None):
+        """Write true target feedback with the one-token shifted MTP embeddings."""
+        starts = self._packed_starts(slots, sequences) if feedback_starts is None else feedback_starts
+        active_slots, shifted, feedback_rows = [], [], []
+        for slot, tokens, next_token in zip(slots, sequences, next_tokens, strict=True):
+            expected = int(self._seq_lens[slot]) - len(tokens)
+            if int(self._mtp_lengths[slot]) != expected:
+                raise RuntimeError("GLM MTP refresh does not continue its committed prefix")
+            self._mtp_ready_tokens.pop(slot, None)
+            inputs = list(tokens[1:]) + ([] if next_token is None else [int(next_token)])
+            if inputs:
+                active_slots.append(slot)
+                shifted.append(inputs)
+                feedback_rows.append(list(range(starts[slot], starts[slot] + len(inputs))))
+        if active_slots:
+            self._run_mtp_phase(shifted, active_slots, feedback_mode=0, feedback_rows=feedback_rows)
+        for slot, next_token in zip(slots, next_tokens, strict=True):
+            if next_token is not None:
+                self._mtp_ready_tokens[slot] = int(next_token)
+
+    def _finish_mtp_tail(self, slots, next_tokens):
+        if len(slots) != len(next_tokens):
+            raise ValueError("GLM MTP needs one next token per request")
+        pending_slots, pending_tokens = [], []
+        for slot, token in zip(slots, next_tokens, strict=True):
+            if int(self._mtp_lengths[slot]) == int(self._seq_lens[slot]):
+                if self._mtp_ready_tokens.get(slot) != int(token):
+                    raise RuntimeError("GLM MTP feedback was prepared for a different next token")
+                continue
+            if int(self._mtp_lengths[slot]) != int(self._seq_lens[slot]) - 1:
+                raise RuntimeError("GLM MTP is missing more than the final target feedback row")
+            pending_slots.append(slot)
+            pending_tokens.append([int(token)])
+        if pending_slots:
+            self._run_mtp_phase(pending_tokens, pending_slots, feedback_mode=1)
+        self._mtp_ready_tokens.update(zip(slots, map(int, next_tokens)))
+
+    def _run_speculative_decode(self, model, batch, prepared):
+        """Propose five tokens, verify causally, and restore only the accepted KDA states."""
+        api = self._api
+        self._drain_forwards()
+        if tuple(batch.request_ids) != prepared.request_ids:
+            raise ValueError("GLM prepared decode request order changed")
+        tokens = [int(token) for token in batch.token_ids.reshape(-1).tolist()]
+        states = [self._requests[request_id] for request_id in batch.request_ids]
+        slots = [state.slot for state in states]
+        lengths = tuple(int(value) for value in batch.seq_lens.reshape(-1).tolist())
+        if lengths != prepared.seq_lens or len(tokens) != len(slots):
+            raise ValueError("GLM decode metadata changed after preparation")
+        if any(state.committed_length < state.prompt_length or length != state.committed_length + 1
+               for state, length in zip(states, lengths, strict=True)):
+            raise ValueError("GLM speculative decode does not continue completed prompts")
+        self._finish_mtp_tail(slots, tokens)
+        allow_speculation = not batch.constraint_states and not batch.stop_token_masks
+        count = min(self._num_speculative_tokens, min(self._max_seq_len - length for length in lengths),
+                    max(0, self._max_num_batched_tokens // len(slots) - 1)) if allow_speculation else 0
+        if count == 0:
+            bounded = []
+            for length, tables in zip(lengths, prepared.cache_groups, strict=True):
+                pages = (length + api.BLOCK_SIZE - 1) // api.BLOCK_SIZE
+                bounded.append({"attention": tables["attention"][:pages],
+                                "kda_state": tables["kda_state"][:min(pages, api.KDA_STATE_BLOCKS)]})
+            single = _PreparedDecode(prepared.request_ids, prepared.seq_lens, prepared.buffer_slot, tuple(bounded))
+            result = self.reclaim_prepared_decode(self.dispatch_prepared_decode(model, batch, single))
+            self._refresh_mtp([[token] for token in tokens], slots, [None] * len(slots))
+            result.num_draft_tokens = [0] * len(slots)
+            return result
+        new_lengths = self._seq_lens.clone()
+        new_lengths[slots] += count + 1
+        groups = []
+        for slot, tables in zip(slots, prepared.cache_groups, strict=True):
+            pages = (int(new_lengths[slot]) + api.BLOCK_SIZE - 1) // api.BLOCK_SIZE
+            groups.append({"attention": tables["attention"][:pages],
+                           "kda_state": tables["kda_state"][:min(pages, api.KDA_STATE_BLOCKS)]})
+        self._bind_cache_tables(slots, new_lengths, groups)
+        committed_mtp = self._mtp_lengths.clone()
+        drafts = [[] for _ in slots]
+        try:
+            for step in range(count):
+                proposed = self._mtp_logits[slots].argmax(-1).tolist()
+                for row, token in zip(drafts, proposed, strict=True):
+                    row.append(int(token))
+                if step + 1 < count:
+                    self._run_mtp_phase([[int(token)] for token in proposed], slots,
+                                        feedback_mode=2, skip_topk=True)
+            self._mtp_lengths.copy_(committed_mtp)
+            self._mtp_ready_tokens = {slot: token for slot, token in self._mtp_ready_tokens.items() if slot not in slots}
+            sequences = [[token, *draft] for token, draft in zip(tokens, drafts, strict=True)]
+            packed = [[] for _ in range(api.BATCH)]
+            state_rows = torch.full((api.BATCH, api.KDA_STATE_COLUMNS), -1, dtype=torch.int32)
+            state_rows[:, :2] = torch.arange(api.BATCH).unsqueeze(1)
+            for slot, sequence in zip(slots, sequences, strict=True):
+                packed[slot] = sequence
+                snapshots = api.BATCH + slot * api.VERIFY_QUERY_WIDTH + torch.arange(api.VERIFY_QUERY_WIDTH)
+                state_rows[slot, 2:2 + api.VERIFY_QUERY_WIDTH] = snapshots
+                state_rows[slot, 1] = snapshots[len(sequence) - 1]
+            inputs = api.prepare_step_inputs(
+                self.weights, packed, kv_seq_lens=self._seq_lens, cache_pages=self.cache_pages,
+                kda_state_rows=state_rows, phase="verify",
+            )
+            starts = self._packed_starts(slots, sequences)
+            total = starts[-1]
+            # prepare_step_inputs already emits exactly arange(total) zero-padded
+            # for this phase; gather_head_rows has no negative-index guard, so the
+            # padding must stay 0 rather than -1.
+            expected = list(range(total))
+            if inputs["logit_row_indices"][:total].tolist() != expected:
+                raise ValueError("GLM verify logit rows must pack in slot order")
+            pending = self._dispatch_step(inputs, phase="verify", buffer_slot=0)
+            try:
+                logits = self._reclaim_step(pending)
+            finally:
+                if pending.error is None:
+                    self._pending_forwards.pop(pending.buffer_slot, None)
+            accepted = []
+            for index, (slot, draft) in enumerate(zip(slots, drafts, strict=True)):
+                params = (batch.sampling_params[index] if batch.sampling_params
+                          else SamplingParams(temperature=0.0, top_p=1.0))
+                accepted.append(self._sampler.sample_speculative(
+                    logits[starts[slot]:starts[slot] + count + 1], draft, params, batch.request_ids[index],
+                ))
+            accepted_lengths = [len(row) for row in accepted]
+            self._commit_target_feedback(slots, sequences, accepted_lengths=accepted_lengths, cache_groups=groups)
+            for slot, state, length in zip(slots, states, accepted_lengths, strict=True):
+                self._seq_lens[slot] += length
+                state.committed_length += length
+            committed_inputs = [sequence[:length] for sequence, length in zip(sequences, accepted_lengths, strict=True)]
+            self._refresh_mtp(committed_inputs, slots, [row[-1] for row in accepted], feedback_starts=starts)
+            return DecodeResult(hidden_states=None, logits=None, accepted_token_ids=accepted,
+                                num_draft_tokens=[count] * len(slots))
+        except BaseException as error:
+            self._invalid_slots.update(slots)
+            self._poison_forwards(error)
+            raise
+
     def _dispatch_step(self, inputs, *, phase, buffer_slot):
         """Stage one slot and submit exactly one complete model program."""
         api = self._api
         self._require_healthy_runtime()
-        if phase not in ("prefill", "decode") or buffer_slot not in (0, 1):
+        if phase not in self.programs or buffer_slot not in (0, 1):
             raise ValueError("GLM dispatch needs a phase and buffer slot zero or one")
         with self._state_lock:
             if buffer_slot in self._pending_forwards:
@@ -695,7 +988,7 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
                 if not bool(torch.isfinite(logits[:api.BATCH]).all()):
                     self.guard_events.append(f"nonfinite logits at step {pending.epoch}")
                     raise FloatingPointError(f"nonfinite last-token logits at step {pending.epoch}")
-                pending.logits = logits[:api.BATCH].clone()
+                pending.logits = logits.clone()
                 self.calls += 1
             except BaseException as error:
                 pending.error = error
@@ -723,6 +1016,8 @@ class Glm53ModelRunner(L3DispatchMixin, ModelRunner):
                         self._seq_lens[slot] += len(tokens)
                     for (_, state), tokens in zip(pending.states, pending.sequences, strict=True):
                         state.committed_length += len(tokens)
+                    if self._num_speculative_tokens:
+                        self._commit_target_feedback(list(pending.slots), pending.sequences)
                     self._pending_forwards.pop(pending.buffer_slot, None)
                     pending.committed = True
             return logits[list(pending.slots)]

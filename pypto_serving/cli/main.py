@@ -107,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Runtime
     parser.add_argument("--max-model-len", type=int, default=1024, help="Maximum sequence length (prompt + generated; default: 1024).")
-    parser.add_argument("--block-size", type=int, default=128, help="KV cache block size (default: 128).")
+    parser.add_argument("--block-size", type=int, default=None, help="KV cache block size (GLM: 640; other models: 128).")
     parser.add_argument(
         "--npu-memory-utilization",
         type=float,
@@ -283,6 +283,8 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
+    if args.block_size is None:
+        args.block_size = 640 if model_family == "glm53" else 128
     if model_family == "deepseek_v41":
         return _build_v41_engine_config(args, model_dir, model_config_data, devices)
     model_variant = _resolve_model_variant(args)
@@ -295,9 +297,12 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     if model_family == "deepseek_v4":
         executor_kwargs["compile_kernels"] = True
         executor_kwargs["num_speculative_tokens"] = num_speculative_tokens
+    elif model_family == "glm53":
+        if model_variant not in ("", "mtp") or not 0 <= num_speculative_tokens <= 5:
+            raise ValueError("GLM supports method='mtp' with 0..5 speculative tokens")
     elif num_speculative_tokens or model_variant:
         raise ValueError(
-            "--speculative-config/--num-speculative-tokens is only supported for DeepSeek V4"
+            "--speculative-config/--num-speculative-tokens is only supported for DeepSeek V4 and GLM"
         )
     # DSpark's attention DP/TP are model-local; the executor owns one EP-wide
     # worker group, with a replicated cache partition per attention group.
@@ -546,6 +551,8 @@ def _resolve_model_variant(args: argparse.Namespace) -> str:
     if speculative_config is None:
         return ""
     method = speculative_config.get("method")
+    if method == "deepseek_mtp":
+        return "mtp"
     if method in ("mtp", "dspark"):
         return str(method)
     raise ValueError(
@@ -574,7 +581,7 @@ def _resolve_num_speculative_tokens(args: argparse.Namespace) -> int:
                     "(DSPARK_QUERY_WIDTH); use 0 to serve the target model only"
                 )
             return int(dspark_tokens)
-        if method != "mtp":
+        if method not in ("mtp", "deepseek_mtp"):
             raise ValueError("DeepSeek V4 --speculative-config requires method='mtp'")
         if "num_speculative_tokens" not in speculative_config:
             raise ValueError(

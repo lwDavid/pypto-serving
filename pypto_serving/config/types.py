@@ -202,6 +202,8 @@ class RuntimeConfig:
     max_new_tokens: int = 256
     # Extra cache positions and execution tokens reserved for speculative decode.
     num_speculative_tokens: int = 0
+    # Model runner implements probability-ratio rejection for non-greedy targets.
+    supports_stochastic_speculation: bool = False
     # Model-specific cache families. Empty means the generic single KV pool.
     kv_cache_groups: tuple[KVCacheGroupSpec, ...] = ()
     # Simpler ring sizing forwarded per-dispatch through pypto's RunConfig
@@ -335,6 +337,9 @@ class PrefillBatch:
     # Stable full prompt lengths. Unlike seq_lens, these do not change between
     # chunked-prefill steps and let device prepare identify the terminal chunk.
     prompt_lens: list[int] = field(default_factory=list)
+    # Known prompt token immediately after each nonterminal chunk. Shifted MTP
+    # caches consume it before the chunk's prefix pages become shareable.
+    next_token_ids: list[int | None] = field(default_factory=list)
     allow_device_greedy_sampling: bool = False
     allow_device_topk_sampling: bool = False
     kv_allocations: list[KvAllocation] = field(default_factory=list)

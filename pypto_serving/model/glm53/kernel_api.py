@@ -20,12 +20,12 @@ import sys
 from pypto_serving.config.types import RuntimeConfig
 
 
-KERNEL_BATCH = 16
+KERNEL_BATCH = 32
+CACHE_BLOCK_SIZE = 640
 PREFILL_CHUNK_ALIGNMENT = 16
 MAX_CAPACITY = 8192
-# Keep the supported budget range unchanged when reducing query padding.
-MAX_NUM_BATCHED_TOKENS = 8177
-MAX_CONTEXT = 8192
+MAX_NUM_BATCHED_TOKENS = 8192
+MAX_CONTEXT = 1048576
 
 
 def build_glm53_runtime_config(
@@ -34,10 +34,12 @@ def build_glm53_runtime_config(
     enable_chunk_prefill: bool, long_prefill_token_threshold: int,
 ) -> RuntimeConfig:
     """Apply GLM cache geometry and prefill limits for CLI and Python callers."""
-    if runtime.page_size != 128:
-        raise ValueError("GLM W8A8 serving requires page_size=128 (--block-size 128)")
+    if runtime.page_size != CACHE_BLOCK_SIZE:
+        raise ValueError("GLM W8A8 serving requires page_size=640 (--block-size 640)")
     if runtime.weight_dtype != "bfloat16":
         raise ValueError("GLM W8A8 serving requires weight_dtype='bfloat16' (--dtype bfloat16)")
+    if type(runtime.num_speculative_tokens) is not int or not 0 <= runtime.num_speculative_tokens <= 5:
+        raise ValueError("GLM num_speculative_tokens must be an integer in 0..5")
     validate_serving_limits(runtime.max_batch_size, runtime.max_seq_len, runtime.max_num_batched_tokens)
     if not 1 <= max_num_running_reqs <= runtime.max_batch_size:
         raise ValueError("GLM max_num_running_reqs must be between 1 and runtime.max_batch_size")
@@ -55,36 +57,45 @@ def build_glm53_runtime_config(
             f"token budget and effective prefill limit >= {minimum}"
         )
     return replace(
-        runtime, prefill_chunk_alignment=PREFILL_CHUNK_ALIGNMENT,
+        runtime, kv_dtype="int8", prefill_chunk_alignment=PREFILL_CHUNK_ALIGNMENT,
+        supports_stochastic_speculation=True,
         max_prefill_tokens_per_request=prefill_limit,
         requires_homogeneous_prefill_decode=True,
         kv_cache_groups=build_glm53_cache_group_specs(
             runtime.max_seq_len, runtime.max_num_batched_tokens, tp_size=tp_size,
+            num_speculative_tokens=runtime.num_speculative_tokens,
         ),
     )
 
 
-def build_glm53_cache_group_specs(max_seq_len, max_num_batched_tokens, *, tp_size=16, cache_tokens=None):
+def build_glm53_cache_group_specs(
+    max_seq_len, max_num_batched_tokens, *, tp_size=16, cache_tokens=None, num_speculative_tokens=0,
+):
     """Describe jointly allocated attention pages and rolling KDA checkpoints."""
     from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
 
     validate_topology(tp_size, tp_size)
     if not 1 <= max_num_batched_tokens <= MAX_CAPACITY:
         raise ValueError("GLM cache groups require 1..8192 query rows")
-    capacity = ((max_num_batched_tokens + 63) // 64) * 64
-    blocks = (max_seq_len + 127) // 128
-    attention_pages = min(16 * blocks, 1048576 // 128) if cache_tokens is None else cache_tokens // 128
-    state_blocks = min(blocks, (capacity + 127) // 128 + 2)
+    capacity = packed_capacity(max_num_batched_tokens)
+    blocks = (max_seq_len + CACHE_BLOCK_SIZE - 1) // CACHE_BLOCK_SIZE
+    max_pages = (MAX_CONTEXT + CACHE_BLOCK_SIZE - 1) // CACHE_BLOCK_SIZE
+    attention_pages = min(KERNEL_BATCH * blocks, max_pages) if cache_tokens is None else cache_tokens // CACHE_BLOCK_SIZE
+    state_blocks = min(blocks, (capacity + CACHE_BLOCK_SIZE - 1) // CACHE_BLOCK_SIZE + 2)
     state_pages = KERNEL_BATCH * (state_blocks + 2)
     sparse_layers = tuple(range(3, 44, 4)) + (45,)
     kda_layers = tuple(layer for layer in range(45) if layer not in sparse_layers)
-    attention_bytes = len(sparse_layers) * (128 * (512 * 2 + 256 * 4) + 32 * (128 + 8 * 4))
+    # Each MLA row contains 512 INT8 values followed by four FP32 group scales.
+    # Indexer pools are BF16. Request-private tail/snapshot storage is not shared
+    # through these immutable attention pages.
+    attention_bytes = len(sparse_layers) * (CACHE_BLOCK_SIZE * 528 + CACHE_BLOCK_SIZE // 4 * 128 * 2)
     state_bytes = len(kda_layers) * (3 * (3 * 64 * 128 // tp_size) * 2 + (64 // tp_size) * 128**2 * 4)
     return (
-        KVCacheGroupSpec("attention", sparse_layers, KVCacheSpec(128, attention_bytes), blocks,
-                         num_blocks=attention_pages, max_requests_per_partition=KERNEL_BATCH),
-        KVCacheGroupSpec("kda_state", kda_layers, KVCacheSpec(128, state_bytes, 128), state_blocks,
-                         num_blocks=state_pages, sliding_window=128,
+        KVCacheGroupSpec("attention", sparse_layers, KVCacheSpec(CACHE_BLOCK_SIZE, attention_bytes), blocks,
+                         num_blocks=attention_pages, max_requests_per_partition=KERNEL_BATCH,
+                         is_eagle_group=bool(num_speculative_tokens)),
+        KVCacheGroupSpec("kda_state", kda_layers, KVCacheSpec(CACHE_BLOCK_SIZE, state_bytes, CACHE_BLOCK_SIZE), state_blocks,
+                         num_blocks=state_pages, sliding_window=CACHE_BLOCK_SIZE,
                          max_requests_per_partition=KERNEL_BATCH),
     )
 
@@ -98,10 +109,10 @@ def validate_topology(tp_size: int, ep_size: int, dp_size: int = 1, device_ids=N
 
 
 def packed_capacity(max_num_batched_tokens: int) -> int:
-    """Round the scheduler's new-token budget to 64 rows without extra slot padding."""
+    """Reserve at least 32 six-token verification rows and align larger budgets to 64."""
     if max_num_batched_tokens <= 0 or max_num_batched_tokens > MAX_NUM_BATCHED_TOKENS:
         raise ValueError(f"GLM max-num-batched-tokens must be 1..{MAX_NUM_BATCHED_TOKENS}")
-    return ((int(max_num_batched_tokens) + 63) // 64) * 64
+    return max(KERNEL_BATCH * 6, ((int(max_num_batched_tokens) + 63) // 64) * 64)
 
 
 def validate_serving_limits(max_requests: int, max_seq_len: int, max_num_batched_tokens: int) -> None:

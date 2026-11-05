@@ -36,6 +36,19 @@ class Sampler:
         if params.temperature <= 0.0:
             return self._greedy_token(logits)
 
+        probs = self._sampling_probabilities(logits, params)
+        if probs is None:
+            return self._greedy_token(logits)
+
+        token = torch.multinomial(
+            probs,
+            num_samples=1,
+            generator=self._generator(probs, params, request_id),
+        )
+        return int(token.item())
+
+    def _sampling_probabilities(self, logits: torch.Tensor, params: SamplingParams) -> torch.Tensor | None:
+        """Apply temperature and top-k/top-p to prepared logits."""
         scaled = logits / max(params.temperature, 1e-5)
 
         if params.top_k is not None and params.top_k > 0 and params.top_k < scaled.numel():
@@ -46,28 +59,72 @@ class Sampler:
 
         probs = torch.softmax(scaled, dim=-1)
         if not self._is_valid_distribution(probs):
-            return self._greedy_token(logits)
+            return None
 
         if 0.0 < params.top_p < 1.0:
             sorted_probs, sorted_indices = torch.sort(probs, descending=True)
             cumulative = torch.cumsum(sorted_probs, dim=-1)
-            keep = cumulative <= params.top_p
+            keep = (cumulative - sorted_probs) < params.top_p
             keep[0] = True
             filtered_probs = torch.zeros_like(probs)
             filtered_probs[sorted_indices[keep]] = probs[sorted_indices[keep]]
             total = filtered_probs.sum()
             if not torch.isfinite(total) or total.item() <= 0.0:
-                return self._greedy_token(logits)
+                return None
             probs = filtered_probs / total
             if not self._is_valid_distribution(probs):
-                return self._greedy_token(logits)
+                return None
 
-        token = torch.multinomial(
-            probs,
-            num_samples=1,
-            generator=self._generator(probs, params, request_id),
-        )
-        return int(token.item())
+        return probs
+
+    def sample_speculative(
+        self,
+        target_logits: torch.Tensor,
+        draft_token_ids: list[int],
+        params: SamplingParams,
+        request_id: str | None = None,
+    ) -> list[int]:
+        """Lossless rejection sampling for deterministic argmax draft proposals.
+
+        Each draft distribution is a point mass. Acceptance probability is the
+        target probability of that token; rejection samples the target with that
+        token removed. A fully accepted prefix receives one target bonus token.
+        """
+        if target_logits.ndim != 2 or target_logits.shape[0] != len(draft_token_ids) + 1:
+            raise ValueError("speculative logits must contain one row per draft plus a bonus row")
+        accepted = []
+        for index, draft in enumerate(draft_token_ids):
+            if not 0 <= draft < target_logits.shape[1]:
+                raise ValueError("draft token is outside the target vocabulary")
+            logits = self._sanitize_logits(target_logits[index])
+            if params.forbidden_token_ids:
+                logits = logits.clone()
+                logits[list(params.forbidden_token_ids)] = float("-inf")
+            if params.temperature <= 0:
+                token = self._greedy_token(logits)
+                accepted.append(token)
+                if token != draft:
+                    return accepted
+                continue
+            probs = self._sampling_probabilities(logits, params)
+            if probs is None:
+                probs = torch.zeros_like(logits)
+                probs[self._greedy_token(logits)] = 1
+            generator = self._generator(probs, params, request_id)
+            uniform = torch.rand((), device=probs.device, generator=generator)
+            if probs[draft] > 0 and uniform <= probs[draft]:
+                accepted.append(draft)
+                continue
+            recovered = probs.clone()
+            recovered[draft] = 0
+            total = recovered.sum()
+            if not torch.isfinite(total) or total <= 0:
+                raise ValueError("rejected draft has no recoverable target probability mass")
+            token = torch.multinomial(recovered / total, 1, generator=generator)
+            accepted.append(int(token.item()))
+            return accepted
+        accepted.append(self.sample(target_logits[-1], params, request_id))
+        return accepted
 
     def sample_from_candidates(
         self,
@@ -115,7 +172,7 @@ class Sampler:
         if 0.0 < params.top_p < 1.0:
             sorted_probs, sorted_positions = torch.sort(probs, descending=True)
             cumulative = torch.cumsum(sorted_probs, dim=-1)
-            keep = cumulative <= params.top_p
+            keep = (cumulative - sorted_probs) < params.top_p
             keep[0] = True
             filtered_probs = torch.zeros_like(probs)
             filtered_probs[sorted_positions[keep]] = probs[sorted_positions[keep]]
